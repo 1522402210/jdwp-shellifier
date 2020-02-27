@@ -12,7 +12,7 @@ usage: poc.py [-h] -t IP [-p PORT] [-c COMMAND]
 poc.py: error: argument -t/--target is required
 
 ## What is new ?
-Added a new way to execute commands, study from [MSF exploit](https://github.com/rapid7/metasploit-framework/blob/master/modules/exploits/multi/misc/java_jdwp_debugger.rb). In this way you can execute the command immediately instead of waiting for a breakpoint event.  
+Added a new way to execute commands, learn from [MSF exploit](https://github.com/rapid7/metasploit-framework/blob/master/modules/exploits/multi/misc/java_jdwp_debugger.rb). In this way you can execute the command immediately instead of waiting for a breakpoint event.  
 ![demo](https://github.com/Lz1y/jdwp-shellifier/blob/master/POC.gif?raw=true)
 ## Useful link
 https://docs.oracle.com/en/java/javase/11/docs/specs/jpda/architecture.html
