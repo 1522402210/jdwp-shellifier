@@ -1,5 +1,5 @@
 # JDWP exploitation script
-通过对Sleeping的线程发送单步执行事件，达成断点，从而可以直接获取上下文、执行命令，而不用等待断点被击中。  
+
 
 ## What is it ?
 This exploitation script is meant to be used by pentesters against active JDWP service, in order to gain Remote Code Execution.
